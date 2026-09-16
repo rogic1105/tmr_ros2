@@ -184,6 +184,26 @@ bool TmDriver::set_pvt_traj(const TmPvtTraj &pvts, const std::string &id)
 	return (sct.send_script_str(id, script) == RC_OK);
 }
 
+void TmDriver::clear_sct_response()
+{
+	std::lock_guard<std::mutex> lock(_sct_response_mtx);
+	_last_sct_response_id.clear();
+	_last_sct_response_script.clear();
+}
+
+void TmDriver::update_sct_response(const std::string &id, const std::string &script)
+{
+	std::lock_guard<std::mutex> lock(_sct_response_mtx);
+	_last_sct_response_id = id;
+	_last_sct_response_script = script;
+}
+
+bool TmDriver::has_sct_response(const std::string &id)
+{
+	std::lock_guard<std::mutex> lock(_sct_response_mtx);
+	return _last_sct_response_id == id;
+}
+
 bool TmDriver::run_pvt_traj(const TmPvtTraj &pvts)
 {
 	if (pvts.points.size() == 0) return false;
@@ -191,6 +211,9 @@ bool TmDriver::run_pvt_traj(const TmPvtTraj &pvts)
 	if (!sct.is_connected()) return false;
 
 	_is_executing_traj = true;
+	tag += 1;
+	if (tag > 15) tag = 1;
+	clear_sct_response();
 
 	if (!set_pvt_traj(pvts)) {
 		_is_executing_traj = false; 
@@ -199,11 +222,22 @@ bool TmDriver::run_pvt_traj(const TmPvtTraj &pvts)
 
 	auto time_start = std::chrono::steady_clock::now();
 	if (_is_executing_traj) {
-		// check QueueTag for check motion done or not
-		tag += 1;
-		if (tag > 15) tag = 1;
-		bool success = set_tag(tag, 0);
-		print_info("[trajectory thread] send QueueTag(%d)", tag);
+		print_info("[trajectory thread] waiting for PvtTraj response before QueueTag(%d)", tag);
+		while (_is_executing_traj && !is_sct_error && !has_sct_response("PvtTraj")) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		bool success = false;
+		if (_is_executing_traj && !is_sct_error) {
+			// QueueTag states live on the controller and can still be true after a
+			// previous driver process used the same tag number.  Clear the local
+			// observation before queueing this trajectory's completion marker so a
+			// stale TMSTA response cannot complete the new action immediately.
+			check_tag = 0;
+			check_tag_status = false;
+			success = set_tag(tag, 0);
+			print_info("[trajectory thread] PvtTraj acknowledged; send QueueTag(%d)", tag);
+		}
 		while (success){
 			if (check_tag == tag && check_tag_status) {
 				print_info("[trajectory thread] get QueueTag(%d), traj DONE !", tag);

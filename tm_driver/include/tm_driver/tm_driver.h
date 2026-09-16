@@ -19,6 +19,9 @@ private:
 	bool _has_sct_thrd = false;
 
 	bool _is_executing_traj = false;
+	std::mutex _sct_response_mtx;
+	std::string _last_sct_response_id;
+	std::string _last_sct_response_script;
 
 	////////////////////////////////
 	// tm_driver Param.
@@ -37,10 +40,13 @@ public:
 		std::condition_variable *psct_cv);
 
 	// Check Trajectory
-	int tag = 1; //tag id: 1-15
+	int tag = 0; //tag id: 1-15; incremented before each trajectory
 	int check_tag = 0; //compare tag id 
 	bool check_tag_status = false;
 	bool is_sct_error = false;
+	void clear_sct_response();
+	void update_sct_response(const std::string &id, const std::string &script);
+	bool has_sct_response(const std::string &id);
 
 	// start: connect to server, run project, connect to listen node
 	bool start(int timeout_ms = -1, bool stick_play = true);

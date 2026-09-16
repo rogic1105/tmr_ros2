@@ -60,6 +60,7 @@ void TmSctRos2::sct_msg(TmSctData data)
     
     sm.sct_msg.id = data.script_id();
     sm.sct_msg.script = std::string{ data.script(), data.script_len() };
+	iface_.update_sct_response(sm.sct_msg.id, sm.sct_msg.script);
 
     listenNodeConnection->check_is_on_listen_node_from_script(sm.sct_msg.id, sm.sct_msg.script);
 
