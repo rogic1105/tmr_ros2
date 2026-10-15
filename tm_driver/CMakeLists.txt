@@ -54,6 +54,10 @@ if (moveit2_lib_auto_judge)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(test_pvt_conversion test/test_pvt_conversion.cpp)
+  target_include_directories(test_pvt_conversion PRIVATE include)
+  target_compile_options(test_pvt_conversion PRIVATE -UNDEBUG)
+  add_test(NAME pvt_conversion COMMAND test_pvt_conversion)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # uncomment the line when a copyright and license is not present in all source files

@@ -3,6 +3,7 @@
 #include "tm_svr_communication.h"
 #include "tm_sct_communication.h"
 #include "tm_command.h"
+#include "tm_pvt_cancel.h"
 
 class TmDriver
 {
@@ -18,7 +19,9 @@ private:
 	bool _has_svr_thrd = false;
 	bool _has_sct_thrd = false;
 
-	bool _is_executing_traj = false;
+	std::atomic<bool> _is_executing_traj{false};
+	TmPvtCancelGate _pvt_cancel_gate;
+	unsigned long _pvt_stop_sequence = 0;
 	std::mutex _sct_response_mtx;
 	std::string _last_sct_response_id;
 	std::string _last_sct_response_script;
@@ -102,7 +105,9 @@ public:
 	bool set_pvt_traj(const TmPvtTraj &pvts, const std::string &id = "PvtTraj");
 
 	bool run_pvt_traj(const TmPvtTraj &pvts);
-	void stop_pvt_traj();
+	bool stop_pvt_traj(bool physical = true);
+	bool prepare_pvt_traj() { return _pvt_cancel_gate.reset(); }
+	bool pvt_stop_unconfirmed() const { return _pvt_cancel_gate.failed_stop(); }
 	void back_to_listen_node();
 	bool get_connect_recovery_guide();
 	void set_connect_recovery_guide(bool is_halt);

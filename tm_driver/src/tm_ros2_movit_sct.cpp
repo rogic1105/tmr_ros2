@@ -1,4 +1,5 @@
 #include "tm_driver/tm_ros2_movit_sct.h"
+#include "tm_driver/tm_pvt_conversion.h"
 void TmRos2SctMoveit::intial_action(){
     as_ = rclcpp_action::create_server<control_msgs::action::FollowJointTrajectory>(
      node->get_node_base_interface(),
@@ -15,7 +16,7 @@ void TmRos2SctMoveit::intial_action(){
 }
 
 rclcpp_action::GoalResponse TmRos2SctMoveit::handle_goal(const rclcpp_action::GoalUUID & uuid,
-  std::shared_ptr<const control_msgs::action::FollowJointTrajectory::Goal> goal)
+  std::shared_ptr<const control_msgs::action::FollowJointTrajectory::Goal>)
 {
   std::unique_lock<std::mutex> lck(goal_mtx_);
   
@@ -37,16 +38,16 @@ rclcpp_action::GoalResponse TmRos2SctMoveit::handle_goal(const rclcpp_action::Go
     }
   }
 
-  if (!has_points(goal->trajectory)) {
-    print_info("[ACTION] -----GOAL REJECT-----");
+  if (iface_.pvt_stop_unconfirmed()) {
+    print_error("[ACTION] STOP ACK unresolved: driver restart required");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  if (!goals_queue_.empty() || goal_thread_open_ || goal_reserved_) {
+    print_info("[ACTION] -----GOAL REJECT BUSY: no deferred PVT queue-----");
     return rclcpp_action::GoalResponse::REJECT;
   }
 
-  if (!goals_queue_.empty()) {
-    print_info("[ACTION] -----GOAL ACCEPT_AND_DEFER-----");
-    return rclcpp_action::GoalResponse::ACCEPT_AND_DEFER;
-  }
-
+  goal_reserved_ = true;
   print_info("[ACTION] -----GOAL ACCEPT-----");
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
@@ -54,19 +55,37 @@ rclcpp_action::GoalResponse TmRos2SctMoveit::handle_goal(const rclcpp_action::Go
 void TmRos2SctMoveit::handle_accepted(
   std::shared_ptr<rclcpp_action::ServerGoalHandle<control_msgs::action::FollowJointTrajectory>> goal_handle)
 {
-  {
-    std::unique_lock<std::mutex> lck(goal_mtx_);
-    goals_queue_.push_back(goal_handle);
+  std::unique_lock<std::mutex> lock(goal_mtx_);
+  goal_reserved_ = false;
+  // Invalid goals receive an action result before any controller dispatch or
+  // cancellation-gate reset. In particular, a short goal must never issue Stop.
+  TmPvtTraj validated;
+  std::string conversion_error;
+  const auto &trajectory = goal_handle->get_goal()->trajectory;
+  const bool joint_count_valid = trajectory.joint_names.size() == 6;
+  if (!joint_count_valid) conversion_error = "PVT trajectory requires six joint names";
+  if (!joint_count_valid ||
+      !tm_convert_joint_pvt(validated, trajectory.points, 0.025, conversion_error)) {
+    auto result = std::make_shared<control_msgs::action::FollowJointTrajectory::Result>();
+    result->error_code = result->INVALID_GOAL;
+    result->error_string = conversion_error;
+    goal_handle->abort(result);
+    return;
   }
+  if (!iface_.prepare_pvt_traj()) {
+    auto result = std::make_shared<control_msgs::action::FollowJointTrajectory::Result>();
+    result->error_code = result->PATH_TOLERANCE_VIOLATED;
+    result->error_string = "STOP ACK unresolved: driver restart required";
+    goal_handle->abort(result);
+    return;
+  }
+  goals_queue_.push_back(goal_handle);
   print_info("[ACTION] goals_queue_ size: %d", goals_queue_.size());
-  
-  if (!goal_thread_open_) {
-    print_debug("Open Goal Thread");
-    if (goal_thread_.joinable()) {
-      goal_thread_.join();
-    }
-    goal_thread_ = std::thread(&TmRos2SctMoveit::execute_goal_traj, this);
-  }
+  // The previous worker sets open=false as its last locked operation. Once
+  // admission succeeds it cannot need this mutex again, so joining is safe.
+  if (goal_thread_.joinable()) goal_thread_.join();
+  goal_thread_open_ = true;
+  goal_thread_ = std::thread(&TmRos2SctMoveit::execute_goal_traj, this);
 }
 
 rclcpp_action::CancelResponse TmRos2SctMoveit::handle_cancel(
@@ -77,13 +96,17 @@ rclcpp_action::CancelResponse TmRos2SctMoveit::handle_cancel(
 
   // if the goal is current
   if(goal_handle->is_executing()) {
-    iface_.stop_pvt_traj();
+    if (!iface_.stop_pvt_traj(!is_fake_)) {
+      print_error("[ACTION CANCEL] controller stop ACK unresolved");
+      return rclcpp_action::CancelResponse::REJECT;
+    }
     print_info("[ACTION CANCEL] stop_pvt_traj()");
     print_info("[ACTION CANCEL] Goal %s execution canceled", goal_id.c_str());
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
   // remove the goal from queue
+  std::unique_lock<std::mutex> lock(goal_mtx_);
   auto it = std::find(goals_queue_.begin(), goals_queue_.end(), goal_handle);
   if(it != goals_queue_.end()) {
     goals_queue_.erase(it);
@@ -99,24 +122,34 @@ rclcpp_action::CancelResponse TmRos2SctMoveit::handle_cancel(
 
 void TmRos2SctMoveit::execute_goal_traj()
 {
-  {
-    std::unique_lock<std::mutex> lck(goal_mtx_);
-    goal_thread_open_ = true;
-  }
   print_info("[ACTION] -----goal execution thread begin-----");
   auto result = std::make_shared<control_msgs::action::FollowJointTrajectory::Result>();
 
-  while (!goals_queue_.empty()){
-    auto goal_handle = goals_queue_.front();
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<control_msgs::action::FollowJointTrajectory>> goal_handle;
+  {
+    std::unique_lock<std::mutex> lock(goal_mtx_);
+    if (goals_queue_.empty()) { goal_thread_open_ = false; return; }
+    goal_handle = goals_queue_.front();
+  }
 
     try {
       auto &traj_points = goal_handle->get_goal()->trajectory.points;
+      auto pvts = std::make_shared<TmPvtTraj>();
+      std::string conversion_error;
+      if (!tm_convert_joint_pvt(*pvts, traj_points, 0.025, conversion_error)) {
+        result->error_code = result->INVALID_GOAL;
+        result->error_string = conversion_error;
+        goal_handle->abort(result);
+        std::unique_lock<std::mutex> lock(goal_mtx_);
+        goals_queue_.clear();
+        goal_thread_open_ = false;
+        return;
+      }
       bool is_match_start_pose = is_positions_match(traj_points.front(), 0.01);
       if (!is_match_start_pose) {
         print_warn("[ACTION] Start point doesn't match current pose");
       }
 
-      auto pvts = get_pvt_traj(traj_points, 0.025);
       print_info("[ACTION] traj. total time:= %d", (int)pvts->total_time);
       if (!goal_handle->is_executing()) {
         goal_handle->execute();
@@ -124,7 +157,24 @@ void TmRos2SctMoveit::execute_goal_traj()
       }
 
       if (!is_fake_) {
-        iface_.run_pvt_traj(*pvts); // run traj and wait for done
+        const bool completed = iface_.run_pvt_traj(*pvts);
+        if (!completed) {
+          // The cancel callback waits for controller STOP ACK before returning
+          // ACCEPT. Let rclcpp commit CANCELING before publishing terminal state.
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+          while (!goal_handle->is_canceling() && goal_handle->is_active() &&
+                 std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!completed && !goal_handle->is_canceling()) {
+          result->error_code = result->PATH_TOLERANCE_VIOLATED;
+          result->error_string = "PVT execution/cancellation acknowledgement unresolved";
+          goal_handle->abort(result);
+          std::unique_lock<std::mutex> lock(goal_mtx_);
+          goals_queue_.clear();
+          goal_thread_open_ = false;
+          return;
+        }
       }
       else {
         iface_.fake_run_pvt_traj(*pvts);
@@ -136,9 +186,9 @@ void TmRos2SctMoveit::execute_goal_traj()
         print_error(result->error_string.c_str());
         iface_.is_sct_error = false;
         goal_handle->abort(result);
-        goals_queue_.clear();
         {
         std::unique_lock<std::mutex> lck(goal_mtx_);
+        goals_queue_.clear();
         goal_thread_open_ = false;
         }
         print_info("[ACTION] ERROR, clean all goals, goal execution thread end");
@@ -174,11 +224,9 @@ void TmRos2SctMoveit::execute_goal_traj()
       result->error_string = "Goal fail !";
       goal_handle->abort(result);
     }
-    goals_queue_.pop_front();
-  }
-
   {
     std::unique_lock<std::mutex> lck(goal_mtx_);
+    goals_queue_.clear();
     goal_thread_open_ = false;
   }
   print_info("[ACTION] -----goal execution thread end-----");
@@ -240,69 +288,4 @@ bool TmRos2SctMoveit::is_positions_match(
       return false;
   }
   return true;
-}
-void TmRos2SctMoveit::set_pvt_traj(
-  TmPvtTraj &pvts, const std::vector<trajectory_msgs::msg::JointTrajectoryPoint> &traj_points, double Tmin)
-{
-  size_t i = 0, i_1 = 0, i_2 = 0;
-  int skip_count = 0;
-  TmPvtPoint point;
-
-  if (traj_points.size() == 0) return;
-
-  pvts.mode = TmPvtMode::Joint;
-
-  auto sec = [](const builtin_interfaces::msg::Duration& t) {
-    return static_cast<double>(t.sec) + 1e-9 * static_cast<double>(t.nanosec);
-  };
-
-  // first point
-  if (sec(traj_points[i].time_from_start) != 0.0) {
-    print_warn("[ACTION] Traj.: first point should be the current position, with time_from_start set to 0.0");
-    point.time = sec(traj_points[i].time_from_start);
-    point.positions = traj_points[i].positions;
-    point.velocities = traj_points[i].velocities;
-    pvts.points.push_back(point);
-  }
-  for (i = 1; i < traj_points.size() - 1; ++i) {
-    point.time = sec(traj_points[i].time_from_start) - sec(traj_points[i_1].time_from_start);
-    if (point.time >= Tmin) {
-      i_2 = i_1;
-      i_1 = i;
-      point.positions = traj_points[i].positions;
-      point.velocities = traj_points[i].velocities;
-      pvts.points.push_back(point);
-    }
-    else {
-      ++skip_count;
-    }
-  }
-  if (skip_count > 0) {
-	    print_warn("[ACTION] Traj.: skip %d points", (int)skip_count);	
-    //RCLCPP_WARN_STREAM(rclcpp::get_logger("rclcpp"),"TM_ROS: Traj.: skip " << (int)skip_count << " points");
-  }
-  // last point
-  if (traj_points.size() > 1) {
-    i =  traj_points.size() - 1;
-    point.time = sec(traj_points[i].time_from_start) - sec(traj_points[i_1].time_from_start);
-    point.positions = traj_points[i].positions;
-    point.velocities = traj_points[i].velocities;
-    if (point.time >= Tmin) {
-      pvts.points.push_back(point);
-    }
-    else {
-      point.time = sec(traj_points[i].time_from_start) - sec(traj_points[i_2].time_from_start);
-      pvts.points.back() = point;
-      ++skip_count;
-      print_warn("[ACTION] Traj.: skip 1 more last point");
-    }
-  }
-  pvts.total_time = sec(traj_points.back().time_from_start);
-}
-std::shared_ptr<TmPvtTraj> TmRos2SctMoveit::get_pvt_traj(
-    const std::vector<trajectory_msgs::msg::JointTrajectoryPoint> &traj_points, double Tmin)
-{
-  std::shared_ptr<TmPvtTraj> pvts = std::make_shared<TmPvtTraj>();
-  set_pvt_traj(*pvts, traj_points, Tmin);
-  return pvts;
 }

@@ -206,64 +206,68 @@ bool TmDriver::has_sct_response(const std::string &id)
 
 bool TmDriver::run_pvt_traj(const TmPvtTraj &pvts)
 {
-	if (pvts.points.size() == 0) return false;
-
-	if (!sct.is_connected()) return false;
-
-	_is_executing_traj = true;
-	tag += 1;
-	if (tag > 15) tag = 1;
-	clear_sct_response();
-
-	if (!set_pvt_traj(pvts)) {
-		_is_executing_traj = false; 
-		return false;
-	}
-
-	auto time_start = std::chrono::steady_clock::now();
-	if (_is_executing_traj) {
-		print_info("[trajectory thread] waiting for PvtTraj response before QueueTag(%d)", tag);
-		while (_is_executing_traj && !is_sct_error && !has_sct_response("PvtTraj")) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
-
-		bool success = false;
-		if (_is_executing_traj && !is_sct_error) {
-			// QueueTag states live on the controller and can still be true after a
-			// previous driver process used the same tag number.  Clear the local
-			// observation before queueing this trajectory's completion marker so a
-			// stale TMSTA response cannot complete the new action immediately.
-			check_tag = 0;
-			check_tag_status = false;
-			success = set_tag(tag, 0);
-			print_info("[trajectory thread] PvtTraj acknowledged; send QueueTag(%d)", tag);
-		}
-		while (success){
-			if (check_tag == tag && check_tag_status) {
-				print_info("[trajectory thread] get QueueTag(%d), traj DONE !", tag);
-				break;
-			}
-			else if (!_is_executing_traj) {
-				set_stop(1);
-				print_info("[trajectory thread] traj STOP !");
-				break;
-			}
-			else if(is_sct_error) {
-				print_error("[trajectory thread] SCT ERROR, traj STOP !");
-				break;
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
-	}
-	auto time_now = std::chrono::steady_clock::now();
-	double time = std::chrono::duration_cast<std::chrono::duration<double>>(time_now - time_start).count();
-
-	print_info("TM_DRV: traj. exec. time:= %.3f", time);
-	return true;
+    if (pvts.points.empty() || !sct.is_connected()) return false;
+    if (!_pvt_cancel_gate.send_if_active([&]() {
+        _is_executing_traj = true;
+        tag = tag % 15 + 1;
+        clear_sct_response();
+        return set_pvt_traj(pvts);
+    })) {
+        _is_executing_traj = false;
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    // QueueTag must be submitted immediately after the PVT script.  TM returns
+    // the PvtTraj response only after the queued script completes (or STOP
+    // interrupts it), so waiting for that response before QueueTag deadlocks
+    // long trajectories.  Clear the locally observed tag first to avoid a
+    // stale completion from an earlier use of the rotating tag number.
+    if (!_is_executing_traj || _pvt_cancel_gate.canceled() || is_sct_error) return false;
+    if (!_pvt_cancel_gate.send_if_active([&]() {
+        check_tag = 0;
+        check_tag_status = false;
+        return set_tag(tag, 0);
+    })) return false;
+    const auto deadline = start + std::chrono::milliseconds(
+        static_cast<long long>((pvts.total_time + 2.0) * 1000));
+    while (_is_executing_traj && !is_sct_error) {
+        if (check_tag == tag && check_tag_status) {
+            _is_executing_traj = false;
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            print_error("PVT completion timed out; stopping, execution failed");
+            stop_pvt_traj();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
 }
-void TmDriver::stop_pvt_traj()
+
+bool TmDriver::stop_pvt_traj(bool physical)
 {
-	_is_executing_traj = false;
+    return _pvt_cancel_gate.cancel_and_confirm([&]() {
+        _is_executing_traj = false;
+        if (!physical) return true;
+        const std::string id = tm_pvt_stop_id(
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+            ++_pvt_stop_sequence);
+        clear_sct_response();
+        if (!set_stop(1, id)) return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        while (std::chrono::steady_clock::now() < deadline) {
+            // Require this stop's controller response, not a local send/cancel ACK.
+            {
+                std::lock_guard<std::mutex> lock(_sct_response_mtx);
+                if (_last_sct_response_id == id)
+                    return _last_sct_response_script == "OK";
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        print_error("PVT stop ACK unresolved; refusing cancellation success");
+        return false;
+    });
 }
 
 void TmDriver::cubic_interp(TmPvtPoint &p, const TmPvtPoint &p0, const TmPvtPoint &p1, double t)

@@ -8,6 +8,7 @@ class TmRos2SctMoveit : public TmSctRos2{
     rclcpp_action::Server<control_msgs::action::FollowJointTrajectory>::SharedPtr as_;
     std::mutex goal_mtx_;
     bool goal_thread_open_;
+    bool goal_reserved_ = false;
     std::thread goal_thread_;
     std::deque< std::pair<rclcpp_action::GoalUUID, std::shared_ptr<const control_msgs::action::FollowJointTrajectory::Goal>> > deferred_goals_;
     std::deque< std::shared_ptr<rclcpp_action::ServerGoalHandle<control_msgs::action::FollowJointTrajectory>> > goals_queue_;
@@ -30,10 +31,6 @@ class TmRos2SctMoveit : public TmSctRos2{
     bool is_traj_finite(const trajectory_msgs::msg::JointTrajectory &traj);
     bool is_positions_match(
       const trajectory_msgs::msg::JointTrajectoryPoint &point, double eps);
-    void set_pvt_traj(
-      TmPvtTraj &pvts, const std::vector<trajectory_msgs::msg::JointTrajectoryPoint> &traj_points, double Tmin);
-      std::shared_ptr<TmPvtTraj> get_pvt_traj(
-    const std::vector<trajectory_msgs::msg::JointTrajectoryPoint> &traj_points, double Tmin = 0.1);
   public:
     TmRos2SctMoveit(rclcpp::Node::SharedPtr node, TmDriver &iface, bool is_fake) 
      : TmSctRos2(node, iface, is_fake)
@@ -44,7 +41,10 @@ class TmRos2SctMoveit : public TmSctRos2{
     }
     ~TmRos2SctMoveit()
     {
-      goals_queue_.clear();
+      {
+        std::lock_guard<std::mutex> lock(goal_mtx_);
+        goals_queue_.clear();
+      }
       if (goal_thread_.joinable())
       {
         goal_thread_.join();
